@@ -1,8 +1,10 @@
-# CodeBlocks files
-*.layout
-*.depend
+*.exe
 *.o
+gmon.out
 bin/
 obj/
-*.exe*.docx
+*.layout
+*.depend
+*.docx
 *.doc
+*.pdf
