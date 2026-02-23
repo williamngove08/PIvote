@@ -2,12 +2,12 @@
 <CodeBlocks_project_file>
 	<FileVersion major="1" minor="6" />
 	<Project>
-		<Option title="Pivoteclient1.0" />
+		<Option title="Pivoteclient2.0" />
 		<Option pch_mode="2" />
 		<Option compiler="gcc" />
 		<Build>
 			<Target title="Debug">
-				<Option output="bin/Debug/Pivoteclient1.0" prefix_auto="1" extension_auto="1" />
+				<Option output="bin/Debug/Pivoteclient1" prefix_auto="1" extension_auto="1" />
 				<Option object_output="obj/Debug/" />
 				<Option type="1" />
 				<Option compiler="gcc" />
@@ -16,7 +16,7 @@
 				</Compiler>
 			</Target>
 			<Target title="Release">
-				<Option output="bin/Release/Pivoteclient1.0" prefix_auto="1" extension_auto="1" />
+				<Option output="bin/Release/Pivoteclient1" prefix_auto="1" extension_auto="1" />
 				<Option object_output="obj/Release/" />
 				<Option type="1" />
 				<Option compiler="gcc" />
@@ -31,7 +31,18 @@
 		<Compiler>
 			<Add option="-Wall" />
 		</Compiler>
-		<Unit filename="main.c">
+		<Linker>
+			<Add library="ws2_32" />
+		</Linker>
+		<Unit filename="PIVOTE_CLIENT_V2.c">
+			<Option compilerVar="CC" />
+		</Unit>
+		<Unit filename="auth.c">
+			<Option compilerVar="CC" />
+		</Unit>
+		<Unit filename="auth.h" />
+		<Unit filename="client.h" />
+		<Unit filename="client_impl.c">
 			<Option compilerVar="CC" />
 		</Unit>
 		<Extensions>
