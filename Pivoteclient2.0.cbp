@@ -34,6 +34,9 @@
 		<Linker>
 			<Add library="ws2_32" />
 		</Linker>
+		<Unit filename="FONCTIONS_PIVOTE_CLIENT_V2.c">
+			<Option compilerVar="CC" />
+		</Unit>
 		<Unit filename="PIVOTE_CLIENT_V2.c">
 			<Option compilerVar="CC" />
 		</Unit>
@@ -42,9 +45,10 @@
 		</Unit>
 		<Unit filename="auth.h" />
 		<Unit filename="client.h" />
-		<Unit filename="client_impl.c">
+		<Unit filename="snake.c">
 			<Option compilerVar="CC" />
 		</Unit>
+		<Unit filename="snake.h" />
 		<Extensions>
 			<lib_finder disable_auto="1" />
 		</Extensions>

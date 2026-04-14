@@ -35,6 +35,9 @@
 			<Add option="-lws2_32" />
 			<Add library="ws2_32" />
 		</Linker>
+		<Unit filename="FONCTIONS_PIVOTE_SERVEUR_V2.c">
+			<Option compilerVar="CC" />
+		</Unit>
 		<Unit filename="PIVOTE_SERVEUR_V2.c">
 			<Option compilerVar="CC" />
 		</Unit>
@@ -43,9 +46,6 @@
 		</Unit>
 		<Unit filename="auth.h" />
 		<Unit filename="serveur.h" />
-		<Unit filename="serveur_impl.c">
-			<Option compilerVar="CC" />
-		</Unit>
 		<Extensions>
 			<lib_finder disable_auto="1" />
 		</Extensions>
