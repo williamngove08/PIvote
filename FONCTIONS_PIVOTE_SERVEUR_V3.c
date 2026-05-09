@@ -25,7 +25,7 @@
 #include <locale.h>
 
 /* =========================================================
- * COULEURS CONSOLE  — doivent etre avant toute fonction
+ * COULEURS CONSOLE  â€” doivent etre avant toute fonction
  * ========================================================= */
 #define COULEUR_NORMAL   7    /* Blanc sur fond noir      */
 #define COULEUR_SELEC   11    /* Cyan clair sur fond noir */
@@ -47,8 +47,121 @@ int nbElecteurs        = 0;
 int nbCandidats        = 0;
 int voteOuvert         = 0;
 int affichageAutoActif = 0;
+time_t voteDeadline    = 0;
+int voteDurationSeconds = 0;
 
 static AuthUser adminConnecte;
+static HANDLE  hThreadServeur = NULL;
+static SOCKET  gServeurSocket = INVALID_SOCKET;
+static SOCKET  gClientSocket  = INVALID_SOCKET;
+static CRITICAL_SECTION gNetCs;
+static int gNetCsInit = 0;
+static volatile LONG gStopReseau = 0;
+static volatile LONG gSessionClosing = 0;
+
+static void runtimeServeurInit(void)
+{
+    if (!gNetCsInit) {
+        InitializeCriticalSection(&gNetCs);
+        gNetCsInit = 1;
+    }
+}
+
+static void setSocketValue(SOCKET *slot, SOCKET value)
+{
+    runtimeServeurInit();
+    EnterCriticalSection(&gNetCs);
+    *slot = value;
+    LeaveCriticalSection(&gNetCs);
+}
+
+static SOCKET takeSocketValue(SOCKET *slot)
+{
+    SOCKET value;
+    runtimeServeurInit();
+    EnterCriticalSection(&gNetCs);
+    value = *slot;
+    *slot = INVALID_SOCKET;
+    LeaveCriticalSection(&gNetCs);
+    return value;
+}
+
+static void clearSocketIfMatches(SOCKET *slot, SOCKET expected)
+{
+    runtimeServeurInit();
+    EnterCriticalSection(&gNetCs);
+    if (*slot == expected)
+        *slot = INVALID_SOCKET;
+    LeaveCriticalSection(&gNetCs);
+}
+
+static void sendAndCloseSocket(SOCKET *slot, const char *message)
+{
+    SOCKET s = takeSocketValue(slot);
+    if (s == INVALID_SOCKET) return;
+    if (message && *message)
+        send(s, message, (int)strlen(message), 0);
+    shutdown(s, SD_BOTH);
+    closesocket(s);
+}
+
+static void notifyAndShutdownSocket(SOCKET *slot, const char *message)
+{
+    SOCKET s = takeSocketValue(slot);
+    if (s == INVALID_SOCKET) return;
+    if (message && *message)
+        send(s, message, (int)strlen(message), 0);
+    shutdown(s, SD_BOTH);
+}
+
+static void clearClientVoteSession(void)
+{
+    voteDeadline = 0;
+}
+
+static void startClientVoteSession(void)
+{
+    voteDeadline = (voteDurationSeconds > 0) ? time(NULL) + voteDurationSeconds : 0;
+}
+
+static int voteOuvertAvecExpiration(void)
+{
+    return voteOuvert != 0;
+}
+
+static int recvWithVoteChecks(SOCKET client, char *buffer, int capacity)
+{
+    while (!InterlockedCompareExchange(&gStopReseau, 0, 0)) {
+        fd_set rfds;
+        struct timeval tv;
+        int ready;
+
+        if (InterlockedCompareExchange(&gSessionClosing, 0, 0))
+            return -3;
+        if (verifierExpirationVote())
+            return -2;
+
+        FD_ZERO(&rfds);
+        FD_SET(client, &rfds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        ready = select(0, &rfds, NULL, NULL, &tv);
+        if (ready == SOCKET_ERROR)
+            return -1;
+        if (ready == 0)
+            continue;
+
+        ready = recv(client, buffer, capacity - 1, 0);
+        if (ready <= 0)
+            return ready;
+
+        buffer[ready] = '\0';
+        return ready;
+    }
+
+    return -3;
+}
 
 /* =========================================================
  * 1. HELPERS CONSOLE
@@ -165,10 +278,23 @@ void afficherCandidats(void)
 /* =========================================================
  * 3. LOGIQUE DE VOTE
  * ========================================================= */
+void ouvrirVoteAvecDuree(int dureeSecondes)
+{
+    if (dureeSecondes < 0) dureeSecondes = 0;
+
+    voteOuvert = 1;
+    voteDurationSeconds = dureeSecondes;
+    clearClientVoteSession();
+
+    if (dureeSecondes > 0)
+        printf("Vote OUVERT. Chaque votant dispose maintenant de %d seconde(s) apres sa connexion.\n", dureeSecondes);
+    else
+        printf("Vote OUVERT sans limite de temps par votant.\n");
+}
+
 void ouvrirVote(void)
 {
-    voteOuvert = 1;
-    printf("Vote OUVERT.\n");
+    ouvrirVoteAvecDuree(0);
 }
 
 /*
@@ -180,7 +306,14 @@ void ouvrirVote(void)
  */
 void fermerVote(void)
 {
+    if (!voteOuvert && voteDeadline == 0) {
+        printf("Vote deja ferme.\n");
+        return;
+    }
+
     voteOuvert = 0;
+    clearClientVoteSession();
+    voteDurationSeconds = 0;
     printf("Vote FERM\xc9.\n\n");
 
     printf("========================================\n");
@@ -193,6 +326,50 @@ void fermerVote(void)
 
     printf("\n");
     genererRapportFinal();
+}
+
+int getVoteTimeRemainingSeconds(void)
+{
+    if (!voteOuvert) return -1;
+    if (voteDeadline == 0)
+        return voteDurationSeconds > 0 ? voteDurationSeconds : -1;
+
+    {
+        time_t now = time(NULL);
+        if (now >= voteDeadline) return 0;
+        return (int)difftime(voteDeadline, now);
+    }
+}
+
+int verifierExpirationVote(void)
+{
+    if (!voteOuvert || voteDeadline == 0) return 0;
+    if (time(NULL) < voteDeadline) return 0;
+
+    sendAndCloseSocket(&gClientSocket, "VOTE_TIMEOUT");
+    clearClientVoteSession();
+    return 1;
+}
+
+void fermerSessionVote(void)
+{
+    InterlockedExchange(&gSessionClosing, 1);
+
+    if (voteOuvert)
+        fermerVote();
+    else {
+        clearClientVoteSession();
+        voteDurationSeconds = 0;
+    }
+
+    sauvegarderDonnees();
+    exporterVersExcel();
+
+    notifyAndShutdownSocket(&gClientSocket, "SESSION_CLOSED");
+    arreterServeurReseau();
+
+    InterlockedExchange(&gSessionClosing, 0);
+    printf("Session fermee. Tous les votants connectes ont ete expulses.\n");
 }
 
 void afficherResultats(void)
@@ -433,7 +610,11 @@ void sauvegarderDonnees(void)
 {
     FILE *f = fopen(FICHIER_SAUVEGARDE, "w");
     if (!f) return;
-    fprintf(f, "%d\n%d\n", voteOuvert, nbElecteurs);
+    fprintf(f, "%d %d %lld\n%d\n",
+            voteOuvert,
+            voteDurationSeconds,
+            0LL,
+            nbElecteurs);
     for (int i = 0; i < nbElecteurs; i++)
         fprintf(f, "%d %s %d %d %s\n",
                 electeurs[i].id, electeurs[i].nom,
@@ -450,8 +631,31 @@ void chargerDonnees(void)
 {
     FILE *f = fopen(FICHIER_SAUVEGARDE, "r");
     if (!f) return;
-    fscanf(f, "%d", &voteOuvert);
-    fscanf(f, "%d", &nbElecteurs);
+    {
+        char line[256];
+        long long savedDeadline = 0;
+        int parsed = 0;
+
+        if (!fgets(line, sizeof(line), f)) {
+            fclose(f);
+            return;
+        }
+
+        parsed = sscanf(line, "%d %d %lld", &voteOuvert, &voteDurationSeconds, &savedDeadline);
+        (void)savedDeadline;
+        voteDeadline = 0;
+
+        if (parsed < 2) {
+            voteDurationSeconds = 0;
+            voteDeadline = 0;
+        }
+
+        if (!fgets(line, sizeof(line), f)) {
+            fclose(f);
+            return;
+        }
+        nbElecteurs = atoi(line);
+    }
     for (int i = 0; i < nbElecteurs; i++)
         fscanf(f, "%d %s %d %d %s",
                &electeurs[i].id, electeurs[i].nom,
@@ -463,6 +667,7 @@ void chargerDonnees(void)
                &candidats[i].id, candidats[i].nom, &candidats[i].voix);
     fclose(f);
     printf(">> Donn\xe9es charg\xe9es.\n");
+    verifierExpirationVote();
 }
 
 void exporterVersExcel(void)
@@ -483,6 +688,33 @@ void exporterVersExcel(void)
 /* =========================================================
  * 6. SERVEUR RESEAU (threads Windows)
  * ========================================================= */
+static void buildCandidatePayload(char *buffer, size_t size)
+{
+    int remaining = getVoteTimeRemainingSeconds();
+    int written = snprintf(buffer, size,
+                           "INFO DEADLINE %lld\nINFO REMAINING %d\n--- LISTE DES CANDIDATS ---\n",
+                           (long long)voteDeadline,
+                           remaining < 0 ? 0 : remaining);
+
+    if (written < 0 || (size_t)written >= size) {
+        if (size > 0) buffer[0] = '\0';
+        return;
+    }
+
+    for (int k = 0; k < nbCandidats; k++) {
+        char ligne[128];
+        int n = snprintf(ligne, sizeof(ligne), "[%d] %s\n", candidats[k].id, candidats[k].nom);
+        if (n <= 0) continue;
+        if ((size_t)written + (size_t)n + 32 >= size) break;
+        memcpy(buffer + written, ligne, (size_t)n);
+        written += n;
+        buffer[written] = '\0';
+    }
+
+    if ((size_t)written + 32 < size)
+        strcat(buffer, "[0] VOTE BLANC\n---------------------------\n");
+}
+
 DWORD WINAPI threadServeurReseau(LPVOID arg)
 {
     WSADATA wsa;
@@ -492,8 +724,11 @@ DWORD WINAPI threadServeurReseau(LPVOID arg)
     char   listeCandidatsStr[BUFFER];
     int    addrlen = sizeof(addr);
 
+    runtimeServeurInit();
+    InterlockedExchange(&gSessionClosing, 0);
     WSAStartup(MAKEWORD(2,2), &wsa);
     serveur = socket(AF_INET, SOCK_STREAM, 0);
+    setSocketValue(&gServeurSocket, serveur);
 
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
@@ -501,19 +736,44 @@ DWORD WINAPI threadServeurReseau(LPVOID arg)
 
     if (bind(serveur, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
         printf("[ERREUR] Impossible de lier le port %d.\n", PORT);
+        sendAndCloseSocket(&gServeurSocket, NULL);
+        WSACleanup();
         return 1;
     }
     listen(serveur, 5);
     printf(">> Serveur r\xe9seau ACTIF sur le port %d.\n", PORT);
 
-    while (1) {
+    while (!InterlockedCompareExchange(&gStopReseau, 0, 0)) {
+        verifierExpirationVote();
         client = accept(serveur, (struct sockaddr*)&addr, &addrlen);
-        if (client == INVALID_SOCKET) continue;
+        if (client == INVALID_SOCKET) {
+            if (InterlockedCompareExchange(&gStopReseau, 0, 0)) break;
+            Sleep(50);
+            continue;
+        }
+
+        setSocketValue(&gClientSocket, client);
+
+        if (InterlockedCompareExchange(&gSessionClosing, 0, 0)) {
+            sendAndCloseSocket(&gClientSocket, "SESSION_CLOSED");
+            continue;
+        }
+
+        if (verifierExpirationVote()) {
+            sendAndCloseSocket(&gClientSocket, "VOTE_TIMEOUT");
+            continue;
+        }
 
         /* Etape 1 : Authentification */
-        int recv_size = recv(client, buffer, BUFFER - 1, 0);
-        if (recv_size <= 0) { closesocket(client); continue; }
-        buffer[recv_size] = '\0';
+        int recv_size = recvWithVoteChecks(client, buffer, BUFFER);
+        if (recv_size == -2) {
+            continue;
+        }
+        if (recv_size <= 0) {
+            clearSocketIfMatches(&gClientSocket, client);
+            closesocket(client);
+            continue;
+        }
 
         char cmd[16];
         char username[AUTH_MAX_USERNAME + 1];
@@ -522,6 +782,7 @@ DWORD WINAPI threadServeurReseau(LPVOID arg)
 
         if (parsed != 3 || strcmp(cmd, "AUTH") != 0) {
             send(client, "AUTH_FAIL", 9, 0);
+            clearSocketIfMatches(&gClientSocket, client);
             closesocket(client);
             continue;
         }
@@ -530,32 +791,70 @@ DWORD WINAPI threadServeurReseau(LPVOID arg)
         AuthStatus stAuth = auth_authenticate(CSV_PATH, username, password, &uAuth);
         if (stAuth != AUTH_OK || strcmp(uAuth.role, "votant") != 0) {
             send(client, "AUTH_FAIL", 9, 0);
+            clearSocketIfMatches(&gClientSocket, client);
             closesocket(client);
             continue;
         }
-        send(client, "AUTH_OK", 7, 0);
+
+        if (InterlockedCompareExchange(&gSessionClosing, 0, 0)) {
+            send(client, "SESSION_CLOSED", 14, 0);
+            clearSocketIfMatches(&gClientSocket, client);
+            closesocket(client);
+            continue;
+        }
+
+        if (verifierExpirationVote()) {
+            send(client, "VOTE_TIMEOUT", 12, 0);
+            clearSocketIfMatches(&gClientSocket, client);
+            closesocket(client);
+            continue;
+        }
+
+        if (!voteOuvertAvecExpiration()) {
+            send(client, "VOTE_CLOSED", 11, 0);
+            clearSocketIfMatches(&gClientSocket, client);
+            closesocket(client);
+            continue;
+        }
+
+        startClientVoteSession();
+        if (verifierExpirationVote()) {
+            continue;
+        }
+
+        send(client, "AUTH_OK\n", 8, 0);
 
         /* Etape 2 : Envoi liste candidats */
-        strcpy(listeCandidatsStr, "\n--- LISTE DES CANDIDATS ---\n");
-        char ligne[100];
-        for (int k = 0; k < nbCandidats; k++) {
-            sprintf(ligne, "[%d] %s\n", candidats[k].id, candidats[k].nom);
-            strcat(listeCandidatsStr, ligne);
-        }
-        strcat(listeCandidatsStr, "[0] VOTE BLANC\n---------------------------\n");
+        buildCandidatePayload(listeCandidatsStr, sizeof(listeCandidatsStr));
         send(client, listeCandidatsStr, strlen(listeCandidatsStr), 0);
 
         /* Etape 3 : Reception du vote */
-        recv_size = recv(client, buffer, BUFFER - 1, 0);
-        if (recv_size <= 0) { closesocket(client); continue; }
-        buffer[recv_size] = '\0';
+        recv_size = recvWithVoteChecks(client, buffer, BUFFER);
+        if (recv_size == -2) {
+            continue;
+        }
+        if (recv_size <= 0) {
+            clearClientVoteSession();
+            clearSocketIfMatches(&gClientSocket, client);
+            closesocket(client);
+            continue;
+        }
 
         char cmd2[16];
         int  idE = -1, idC = -1;
         sscanf(buffer, "%15s %d %d", cmd2, &idE, &idC);
 
         int ok = 0;
-        if (strcmp(cmd2, "VOTE") == 0 && voteOuvert) {
+        const char *reply = "ERREUR";
+        int replyLen = 6;
+
+        if (InterlockedCompareExchange(&gSessionClosing, 0, 0)) {
+            reply = "SESSION_CLOSED";
+            replyLen = 14;
+        } else if (verifierExpirationVote()) {
+            reply = "VOTE_TIMEOUT";
+            replyLen = 12;
+        } else if (strcmp(cmd2, "VOTE") == 0 && voteOuvertAvecExpiration()) {
             for (int i = 0; i < nbElecteurs; i++) {
                 if (electeurs[i].id == idE
                     && strcmp(electeurs[i].username, username) == 0
@@ -575,6 +874,13 @@ DWORD WINAPI threadServeurReseau(LPVOID arg)
                     break;
                 }
             }
+            if (!ok) {
+                reply = "ERREUR";
+                replyLen = 6;
+            }
+        } else if (!voteOuvert) {
+            reply = "VOTE_CLOSED";
+            replyLen = 11;
         }
 
         if (ok) {
@@ -582,16 +888,24 @@ DWORD WINAPI threadServeurReseau(LPVOID arg)
             sauvegarderDonnees();
             exporterVersExcel();
         } else {
-            send(client, "ERREUR", 6, 0);
+            send(client, reply, replyLen, 0);
         }
+        clearClientVoteSession();
+        clearSocketIfMatches(&gClientSocket, client);
         closesocket(client);
     }
+
+    clearClientVoteSession();
+    notifyAndShutdownSocket(&gClientSocket, NULL);
+    sendAndCloseSocket(&gServeurSocket, NULL);
+    WSACleanup();
     return 0;
 }
 
 DWORD WINAPI threadAffichageTempsReel(LPVOID arg)
 {
     while (affichageAutoActif) {
+        verifierExpirationVote();
         system("cls");
         printf("===== CONTROLE EN TEMPS REEL =====\n");
         afficherBarresASCII();
@@ -606,14 +920,54 @@ DWORD WINAPI threadAffichageTempsReel(LPVOID arg)
 
 void lancerServeurReseau(void)
 {
-    HANDLE thread = CreateThread(NULL, 0, threadServeurReseau, NULL, 0, NULL);
-    if (!thread) {
+    if (!demarrerServeurReseauAsync()) {
         printf("Erreur thread r\xe9seau.\n");
         return;
     }
     affichageAutoActif = 1;
     CreateThread(NULL, 0, threadAffichageTempsReel, NULL, 0, NULL);
     printf("Mode r\xe9seau actif. Appuyez sur 0 pour quitter proprement.\n");
+}
+
+int demarrerServeurReseauAsync(void)
+{
+    runtimeServeurInit();
+
+    if (serveurReseauActif())
+        return 0;
+
+    if (hThreadServeur) {
+        CloseHandle(hThreadServeur);
+        hThreadServeur = NULL;
+    }
+
+    InterlockedExchange(&gStopReseau, 0);
+    InterlockedExchange(&gSessionClosing, 0);
+    hThreadServeur = CreateThread(NULL, 0, threadServeurReseau, NULL, 0, NULL);
+    return hThreadServeur != NULL;
+}
+
+void arreterServeurReseau(void)
+{
+    InterlockedExchange(&gStopReseau, 1);
+    affichageAutoActif = 0;
+
+    notifyAndShutdownSocket(&gClientSocket, NULL);
+    sendAndCloseSocket(&gServeurSocket, NULL);
+
+    if (hThreadServeur) {
+        WaitForSingleObject(hThreadServeur, 2000);
+        CloseHandle(hThreadServeur);
+        hThreadServeur = NULL;
+    }
+
+    sendAndCloseSocket(&gClientSocket, NULL);
+}
+
+int serveurReseauActif(void)
+{
+    if (!hThreadServeur) return 0;
+    return WaitForSingleObject(hThreadServeur, 0) == WAIT_TIMEOUT;
 }
 
 /* =========================================================
